@@ -1,0 +1,51 @@
+#!/bin/zsh
+# Relaunch a macOS app with its own time zone (default: Asia/Shanghai).
+# Usage: tzapp <AppName|/path/to/App.app> [IANA_TZ]
+#   tzapp DingTalk
+#   tzapp W
+#   tzapp W Asia/Tokyo
+set -euo pipefail
+
+die() { print -u2 "tzapp: $*"; exit 1; }
+
+(( $# >= 1 )) || die "usage: tzapp <AppName|/path/to/App.app> [IANA_TZ]"
+app=$1
+tz=${2:-Asia/Shanghai}
+
+[[ -f /usr/share/zoneinfo/$tz ]] || die "unknown time zone: $tz"
+
+if [[ -d $app ]]; then
+  app_path=${app:A}
+else
+  name=${app%.app}.app
+  for dir in /Applications ~/Applications /System/Applications /Applications/Utilities /System/Applications/Utilities; do
+    [[ -d $dir/$name ]] && { app_path=$dir/$name; break; }
+  done
+  : ${app_path:=$(mdfind "kMDItemContentType == 'com.apple.application-bundle' && kMDItemFSName == '$name'"c | head -1)}
+  [[ -n $app_path ]] || die "application not found: $app"
+fi
+
+info=$app_path/Contents/Info.plist
+exe=$app_path/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info")
+bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info")
+
+main_pid() { ps -Ao pid=,comm= | awk -v e="$exe" '{p=$1; sub(/^ *[0-9]+ /, "")} $0 == e && !f {print p; f=1}'; }
+
+if [[ -n $(main_pid) ]]; then
+  print "Quitting ${app_path:t}..."
+  osascript -e "tell application id \"$bundle_id\" to quit" >/dev/null 2>&1 || kill -TERM "$(main_pid)"
+  for _ in {1..60}; do [[ -z $(main_pid) ]] && break; sleep 0.5; done
+  [[ -z $(main_pid) ]] || die "${app_path:t} did not quit within 30s (unsaved-changes dialog?)"
+fi
+
+# __XPC_TZ propagates TZ into XPC services (e.g. WKWebView's WebKit processes)
+open -n --env "TZ=$tz" --env "__XPC_TZ=$tz" "$app_path"
+
+for _ in {1..20}; do pid=$(main_pid); [[ -n $pid ]] && break; sleep 0.5; done
+[[ -n ${pid:-} ]] || die "${app_path:t} did not start"
+
+if ps -E -ww -o command= -p "$pid" | tr ' ' '\n' | grep -qx "TZ=$tz"; then
+  print "${app_path:t} (pid $pid) running with TZ=$tz"
+else
+  die "${app_path:t} started (pid $pid) but TZ=$tz not found in its environment"
+fi
